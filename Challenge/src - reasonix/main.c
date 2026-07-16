@@ -1,0 +1,191 @@
+#define _POSIX_C_SOURCE 199309L
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include "engine.h"
+
+/* ── Worker thread ────────────────────────────────────────────────── */
+
+typedef struct {
+    Engine *engine;
+    int     worker_id;
+    bool    running;
+} WorkerCtx;
+
+static void *worker_thread(void *arg) {
+    WorkerCtx *ctx = (WorkerCtx *)arg;
+    printf("[Worker %d] Started\n", ctx->worker_id);
+
+    while (ctx->running) {
+        engine_tick(ctx->engine);
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000000 };  /* 1ms */
+        nanosleep(&ts, NULL);
+    }
+
+    printf("[Worker %d] Stopped\n", ctx->worker_id);
+    return NULL;
+}
+
+/* ── Test helpers ─────────────────────────────────────────────────── */
+
+/* Forward declaration from parser.c */
+extern uint32_t serialize_message(const ParsedMessage *msg, uint8_t *buf, uint32_t buf_len);
+
+static void test_basic_submit(Engine *e) {
+    printf("\n── Test: Basic Submit ──\n");
+
+    /* Use serialize_message to build a well-formed message with proper CRC */
+    ParsedMessage msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.type = MSG_PUT;
+    const char *key = "hello";
+    const char *val = "world";
+    msg.key_len = (uint32_t)strlen(key);
+    msg.value_len = (uint32_t)strlen(val);
+    memcpy(msg.key, key, msg.key_len);
+    memcpy(msg.value, val, msg.value_len);
+
+    uint8_t raw[256];
+    uint32_t total = serialize_message(&msg, raw, sizeof(raw));
+
+    int rc = engine_submit(e, 0, raw, total);
+    printf("  Submit result: %d (expected: 0 = ERR_NONE)\n", rc);
+
+    /* Process a few ticks */
+    for (int i = 0; i < 5; i++) {
+        engine_tick(e);
+    }
+
+    char stats[512];
+    engine_stats(e, stats, sizeof(stats));
+    printf("%s", stats);
+}
+
+static void test_memory_stress(Engine *e) {
+    printf("\n── Test: Memory Stress ──\n");
+
+    void *ptrs[100];
+    int allocs = 0;
+
+    for (int i = 0; i < 100; i++) {
+        size_t sz = (size_t)((i % 10) + 1) * 32;  /* 32 to 320 bytes */
+        ptrs[i] = mem_alloc(&e->mem, sz);
+        if (ptrs[i]) {
+            allocs++;
+        } else {
+            printf("  Allocation %d (size %zu) failed\n", i, sz);
+            break;
+        }
+    }
+
+    printf("  Allocated: %d blocks\n", allocs);
+
+    /* Free odd-indexed allocations */
+    for (int i = 0; i < allocs; i++) {
+        if (i % 2 == 1) {
+            mem_free(&e->mem, ptrs[i]);
+        }
+    }
+
+    uint32_t a, f, fb;
+    mem_stats(&e->mem, &a, &f, &fb);
+    printf("  After free: allocated=%u freed=%u free_blocks=%u\n", a, f, fb);
+}
+
+static void test_crypto_roundtrip(Engine *e) {
+    printf("\n── Test: Crypto Roundtrip ──\n");
+
+    const char *plain = "Secret message for encryption test!";
+    uint32_t len = (uint32_t)strlen(plain);
+
+    uint8_t cipher[128];
+    uint8_t decrypted[128];
+
+    uint32_t enc_len = crypto_encrypt(&e->crypto, (const uint8_t *)plain, cipher, len);
+    printf("  Encrypted %u bytes\n", enc_len);
+
+    uint32_t dec_len = crypto_decrypt(&e->crypto, cipher, decrypted, enc_len);
+    printf("  Decrypted %u bytes\n", dec_len);
+
+    decrypted[dec_len] = '\0';
+    printf("  Original:  '%s'\n", plain);
+    printf("  Decrypted: '%s'\n", decrypted);
+    printf("  Match: %s\n", strcmp(plain, (char *)decrypted) == 0 ? "YES" : "NO");
+}
+
+static void test_scheduler_overflow(Engine *e) {
+    printf("\n── Test: Scheduler Overflow ──\n");
+
+    uint8_t payload[32];
+    memset(payload, 0xAA, sizeof(payload));
+
+    /* Enqueue more than MAX_TASKS tasks — should expose bugs */
+    for (int i = 0; i < MAX_TASKS + 20; i++) {
+        uint64_t id = sched_enqueue(&e->sched, payload, sizeof(payload), PRIO_NORMAL);
+        if (id == 0 && i < MAX_TASKS) {
+            printf("  Enqueue %d failed unexpectedly (id=0)\n", i);
+        }
+    }
+
+    printf("  Enqueued %d tasks, queue count=%u\n",
+           MAX_TASKS + 20, e->sched.count);
+
+    /* Try to dequeue some */
+    Task t;
+    int dequeued = 0;
+    while (sched_dequeue(&e->sched, &t)) {
+        dequeued++;
+        if (dequeued >= MAX_TASKS + 30) break;
+    }
+    printf("  Dequeued %d tasks\n", dequeued);
+}
+
+/* ── Main ─────────────────────────────────────────────────────────── */
+
+int main(int argc, char **argv) {
+    (void)argc; (void)argv;
+    setbuf(stdout, NULL);  /* unbuffered — ensures output survives crashes */
+    printf("=== NexusDB — Distributed Task Engine ===\n");
+    printf("Build: %s %s\n", __DATE__, __TIME__);
+    printf("Arch: %zu-bit, MAX_TASKS=%d, POOL_SIZE=%d\n",
+           sizeof(void*) * 8, MAX_TASKS, POOL_SIZE);
+
+    Engine engine;
+    uint8_t key[17] = "nexusdb-key-128!";
+
+    if (engine_init(&engine, key, 16) != 0) {
+        fprintf(stderr, "FATAL: engine_init failed\n");
+        return 1;
+    }
+
+    /* Run tests */
+    test_basic_submit(&engine);
+    test_memory_stress(&engine);
+    test_crypto_roundtrip(&engine);
+    test_scheduler_overflow(&engine);
+
+    /* Start worker thread */
+    WorkerCtx wctx = { .engine = &engine, .worker_id = 1, .running = true };
+    pthread_t worker;
+    pthread_create(&worker, NULL, worker_thread, &wctx);
+
+    /* Let it run for a bit */
+    struct timespec ts_sleep = { .tv_sec = 0, .tv_nsec = 50000000 };  /* 50ms */
+    nanosleep(&ts_sleep, NULL);
+
+    /* Shutdown */
+    wctx.running = false;
+    pthread_join(worker, NULL);
+
+    engine_shutdown(&engine);
+
+    printf("\n=== NexusDB Shutdown Complete ===\n");
+    printf("Ops: completed=%lu failed=%lu\n",
+           (unsigned long)engine.ops_completed,
+           (unsigned long)engine.ops_failed);
+
+    return 0;
+}
